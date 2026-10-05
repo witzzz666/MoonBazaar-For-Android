@@ -1,0 +1,216 @@
+name: Build APK
+
+# 用仓库内的 example 签名（signMode=demo）构建 Release 包。
+# 构建参数与产物收集逻辑对齐本地脚本 build_all.bat：
+#   - 任务名 assemble<Flavor>Release / bundle<Flavor>Release
+#   - 通过 -PsignMode / -PversionCode / -PversionName 传入
+#   - build.gradle.kts 的 collectDist 会把产物汇总到 build/dist
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      flavors:
+        description: 要构建的 ABI 变体
+        type: choice
+        required: true
+        default: 全部
+        options:
+          - 全部
+          - arm64
+          - arm_all
+          - arm32
+          - x8664
+      packageType:
+        description: 产物类型
+        type: choice
+        required: true
+        default: APK
+        options:
+          - APK
+          - AAB
+      versionName:
+        description: versionName（留空则读 gradle.properties 的 VERSION_NAME）
+        type: string
+        required: false
+        default: ''
+      versionCode:
+        description: versionCode（留空则读 VERSION_CODE，再回退到 run_number）
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ github.event.inputs.packageType || 'APK' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # 与本地一致：gradle/gradle-daemon-jvm.properties 要求 toolchain 25
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # compileSdk / targetSdk = 37，与本地 SDK 保持一致。
+      #
+      # 两个容易踩的坑：
+      # 1) packages 是按「单个空格」切分的，必须写成一行，不能换行；
+      # 2) API 37 起平台采用「次版本」命名，仓库里只有 platforms;android-37.0 /
+      #    37.1 / 37.2，**没有** platforms;android-37，写错会直接安装失败。
+      #    build-tools 与本地一致用 36.0.0（AGP 的默认版本）。
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
+          accept-android-sdk-licenses: 'true'
+          log-accepted-android-sdk-licenses: 'false'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # 解析 versionName / versionCode，规则对齐 build_all.bat：
+      # 命令行 > gradle.properties > 兜底（versionName=1.0.0，versionCode=run_number）
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          prop() { grep -m1 "^$1=" gradle.properties | cut -d= -f2- | tr -d '\r' || true; }
+
+          name='${{ github.event.inputs.versionName }}'
+          [ -n "$name" ] || name="$(prop VERSION_NAME)"
+          [ -n "$name" ] || name="1.0.0"
+
+          code='${{ github.event.inputs.versionCode }}'
+          printf '%s' "$code" | grep -Eq '^[0-9]+$' || code="$(prop VERSION_CODE)"
+          printf '%s' "$code" | grep -Eq '^[0-9]+$' || code='${{ github.run_number }}'
+          if [ "$code" -lt 1 ]; then code=1; fi
+
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "将构建 versionName=$name versionCode=$code"
+
+      - name: Build with example signing
+        shell: bash
+        env:
+          FLAVORS_INPUT: ${{ github.event.inputs.flavors || '全部' }}
+          PACKAGE_TYPE: ${{ github.event.inputs.packageType || 'APK' }}
+          VERSION_NAME: ${{ steps.version.outputs.name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+        run: |
+          set -euo pipefail
+
+          # 仓库里 gradlew 的权限位曾被记录为 100644，Linux 上不可执行，这里兜底修正
+          chmod +x gradlew
+
+          case "$FLAVORS_INPUT" in
+            全部|all) flavors="arm_all arm64 arm32 x8664" ;;
+            *)        flavors="$FLAVORS_INPUT" ;;
+          esac
+
+          tasks=""
+          for f in $flavors; do
+            case "$f" in
+              arm_all) cap=Arm_all ;;
+              arm64)   cap=Arm64 ;;
+              arm32)   cap=Arm32 ;;
+              x8664)   cap=X8664 ;;
+              *) echo "::error::未知的 ABI 变体: $f"; exit 1 ;;
+            esac
+            if [ "$PACKAGE_TYPE" = "AAB" ]; then
+              tasks="$tasks bundle${cap}Release"
+            else
+              tasks="$tasks assemble${cap}Release"
+            fi
+          done
+
+          echo "构建任务:$tasks"
+          echo "签名方式: demo (signature/example.jks)"
+
+          ./gradlew $tasks \
+            -PsignMode=demo \
+            -PversionCode="$VERSION_CODE" \
+            -PversionName="$VERSION_NAME" \
+            --no-configuration-cache \
+            --stacktrace
+
+      - name: List artifacts
+        shell: bash
+        run: ls -lh build/dist
+
+      # 确认 demo 签名确实生效（未签名的包会命名为 *-unsigned.apk，这里会直接失败）
+      - name: Verify signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apksigner="$(find "${ANDROID_SDK_ROOT}/build-tools" -name apksigner -type f 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$apksigner" ]; then
+            echo "::warning::未找到 apksigner，跳过签名校验"
+            exit 0
+          fi
+          for apk in build/dist/*.apk; do
+            echo "== $apk"
+            "$apksigner" verify --print-certs "$apk" | head -4
+          done
+
+      - name: Upload APK
+        if: ${{ (github.event.inputs.packageType || 'APK') == 'APK' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: moonbazaar-apk-${{ steps.version.outputs.name }}-${{ steps.version.outputs.code }}
+          path: build/dist/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload AAB
+        if: ${{ (github.event.inputs.packageType || 'APK') == 'AAB' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: moonbazaar-aab-${{ steps.version.outputs.name }}-${{ steps.version.outputs.code }}
+          path: build/dist/*.aab
+          if-no-files-found: error
+          retention-days: 30
+
+  # 打 tag（v*）时把产物挂到 GitHub Release 上
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+          || gh release upload "$GITHUB_REF_NAME" dist/* --clobber
