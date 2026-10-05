@@ -157,6 +157,30 @@ adb install -r app\build\outputs\apk\debug\app-debug.apk
 
 > 提示：若只改了 Kotlin 源码，可用 `.\gradlew.bat :app:compileDebugKotlin` 快速校验编译。
 
+## 持续集成（GitHub Actions）
+
+`.github/workflows/android-build.yml` 用仓库内的 **example 签名**（`signMode=demo`）构建 Release 包，
+构建参数与 `build_all.bat` 对齐，产物由 `collectDist` 汇总到 `build/dist` 后上传为 Artifact。
+
+**触发方式**
+
+| 事件 | 行为 |
+|---|---|
+| push 到 `main` / `master` | 构建全部 4 个 ABI 的 Release APK |
+| Pull Request | 同上，用于校验改动能正常打包 |
+| push `v*` 标签 | 构建后额外创建 GitHub Release 并挂上产物 |
+| 手动 `workflow_dispatch` | 可选 ABI 变体、APK/AAB、versionName、versionCode |
+
+**关键实现细节**
+
+- JDK 25（与 `gradle/gradle-daemon-jvm.properties` 的 toolchain 要求一致）、`platforms;android-37.0`、`build-tools;36.0.0`；
+- versionName / versionCode 解析顺序：手动输入 > `gradle.properties` > 兜底（`1.0.0` / `run_number`）；
+- 构建后会调用 `apksigner` 校验签名，未签名的包（`*-unsigned.apk`）会直接让流水线失败；
+- `setup-android` 的 `packages` 输入按**单个空格**切分，必须写成一行。
+
+> 注意：`example.jks` 的密钥与口令是公开的（仓库内硬编码），仅用于演示与分发测试。
+> 若要做正式发布签名，请改用 `signMode=custom`，把 keystore 与口令放到 GitHub Secrets 中传入。
+
 ## 配置项
 
 所有可调参数集中在 `app/src/main/java/top/witzzz/moonbazaar/data/AppConfig.kt`：
