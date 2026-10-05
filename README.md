@@ -71,7 +71,7 @@ MoonBazaar 不提供密码登录 API，登录必须发生在官方页面。本�
 **为什么用 App 内 WebView 而不是系统浏览器？**
 系统浏览器无法把 `<token>` 送回 App（Worker 的落地页是一次性 HTML 页面，不会跳回自定义 scheme）。因此登录流程完全在 App 内完成，由 WebView 监视地址并在 `/auth/done` 落地瞬间截获令牌。
 
-**会话存储**：支持多账号，账号列表与当前选中项持久化在 `SharedPreferences`（`moonbazaar_session` → `accounts_json` / `current_key`），并自动迁移旧版本的单账号 token。
+**会话存储**：支持多账号，账号列表与当前选中项持久化在 `SharedPreferences`（`moonbazaar_session` → `accounts_json` / `current_key`），并自动迁移旧版本的单账号 token。`accounts_json` 以 **Android Keystore 加密后的密文**落盘（格式 `v1:<iv>:<ciphertext>`），首次读取历史明文数据时会自动重写为密文。
 
 ## 技术栈
 
@@ -167,6 +167,8 @@ adb install -r app\build\outputs\apk\debug\app-debug.apk
 | `BASE_HOST` | `mnb.witzzz.top` | 用于识别登录落地页 `/auth/done`，需与 `BASE_URL` 的 host 一致 |
 | `CALLBACK_URI` | `mnb://auth/callback` | 深链回调，需与 `AndroidManifest.xml` 中 intent-filter 一致 |
 | `CALLBACK_SCHEME` | `mnb` | 深链 scheme |
+| `CALLBACK_HOST` | `auth` | 深链 authority，回调校验时要求完全匹配 |
+| `CALLBACK_PATH` | `/callback` | 深链 path，回调校验时要求完全匹配 |
 | `SOURCE_APP` | `android` | 请求头 `X-Source-App`，便于 Worker 端日志追踪 |
 
 服务端需保证：Worker 已完成部署、已绑定 KV、已配置 `API_KEY` 与 `ENCRYPTION_KEY`，且 `REDIRECT_URI` 与开发者面板登记一致。
@@ -189,19 +191,29 @@ adb install -r app\build\outputs\apk\debug\app-debug.apk
 2. 问卷 / 兑换 / 邀请 / 提现被替换为只读禁用页；
 3. ViewModel 层在发起请求前拦截，不会向上游发送写操作。
 
-**账号切换**
+**账号切换（账号作用域）**
 - 切换账号时会先清空界面状态（首页 / 交易 / 问卷 / 邀请 / 提现）再重新拉取，避免两个账号的数据串台；
 - 退出当前账号会尽力吊销 Worker session，并从本地账号列表移除；若仍有其它账号则自动切换过去。
+
+**账号作用域与请求绑定（防旧响应串台）**
+- ViewModel 维护一个「账号世代号」：切换账号 / 登出 / 移除账号时递增，并取消上一个账号的全部在途请求；
+- 每个请求在**发起时**快照「世代号 + 该账号的 token」，网络返回后先校验世代号，只有仍属于当前账号的响应才允许写入界面；
+- 仅靠取消是不够的：OkHttp 的 `execute()` 是阻塞调用、不响应协程取消，取消后协程体仍会继续执行到下一个挂起点，因此必须再校验一次世代号；
+- 请求头 `X-Client-Session` 与幂等键都使用快照下来的 token，避免请求真正执行时账号已被切换而带到另一个账号名下；
+- `Session.identify()` 按 **token** 定位要回填的账号（而不是「当前账号」），否则 A 的响应会把 UID 写到已切换到的 B 上。
 
 ## 安全说明
 
 - **API Key 永不进入 App**：客户端只与自建 Worker 通信，`X-API-Key` 由 Worker 在服务端注入。
 - **用户令牌不下发到 App**：Worker 只回传 session token，用户 `access_token` / `refresh_token` 始终加密保存在 Cloudflare KV。
 - **登录前清理浏览器数据**：每次打开登录页都会清空 WebView 的 Cookie、WebStorage、表单数据与缓存，防止账号串号。
+- **session token 加密落盘**：token 使用 Android Keystore 中的 AES/GCM 密钥加密后写入 `SharedPreferences`，密钥不出进程、不参与备份；加密失败时宁可不落盘，也不写明文。
+- **会话数据不参与备份**：`backup_rules.xml` / `data_extraction_rules.xml` 均排除了 `moonbazaar_session.xml`，云备份与换机迁移都不会带走账号凭据。
+- **登录回调白名单校验**：深链必须同时匹配 `mnb` + `auth` + `/callback` 三个部分，且仅在本进程内主动发起过登录时才接受其中的 `session_token`；令牌被消费后即失效，无法重放。
 - **不要提交真实密钥**：`local.properties`、Worker 的 `.dev.vars`、开发者面板的 API Key 均不应进入版本库。
 
 ## 已知限制
 
-- session token 目前以明文存于 `SharedPreferences`，后续可替换为 `EncryptedSharedPreferences` 提升本地安全性。
+- 会话密文由 Android Keystore 密钥保护：若用户在系统设置中清除应用数据、或 Keystore 密钥失效，本地账号列表会不可解并清空，需要重新登录。
 - 提现需要账号满足商品的可见性条件（如注册天数、累计收益），不满足时接口会返回业务错误，界面直接展示原始返回。
 - 部分接口（交易、邀请、问卷）的字段名以**线上真实返回**为准做了兼容处理（如问卷为 `id` / `payout` / `link`，而非文档示例中的 `survey_id` / `reward` / `url`）；若上游调整字段，需同步更新 `MoonRepository` / `MainViewModel` 中的解析逻辑。

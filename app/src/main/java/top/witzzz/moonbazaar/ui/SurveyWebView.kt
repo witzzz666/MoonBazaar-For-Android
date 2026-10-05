@@ -9,15 +9,29 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -130,6 +144,141 @@ private fun proxyFetch(newUrl: String, request: WebResourceRequest): WebResource
     }
 }
 
+// ==================== 问卷完成 / 退出 回调拦截 ====================
+// 普通形式：https://moonbazaar.xyz/home/surveys?status=a&gc=b
+//   status: 1=成功  2=不符合条件
+//   gc    : 获得的 GC（整数）；也可能是 check_history（则不显示金额，提示查看历史）
+// CPX 形式：https://moonbazaar.xyz/home/surveys?type=out&GC=补偿金额&cpx_message_id=...&from=cpx
+//   type  : out（被踢出）或 complete（完成）
+//   GC    : 成功/不符合条件时的补偿金额（可能没有）
+//   cpx_message_id: 一般是网址，成功时用于打开评价页
+//   from  : 忽略
+
+enum class SurveyOutcome { SUCCESS, INELIGIBLE, OUT, NEUTRAL }
+
+internal data class SurveyResult(
+    val outcome: SurveyOutcome = SurveyOutcome.NEUTRAL,
+    val gcText: String? = null,          // 非空则显示金额
+    val checkHistory: Boolean = false,   // gc=check_history
+    val messageId: String? = null        // CPX 评价链接
+) {
+    /** 评价链接看起来像网址时才提供入口。 */
+    val ratingUrl: String?
+        get() = messageId?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+}
+
+private const val RESULT_HOST = "moonbazaar.xyz"
+private const val RESULT_PATH = "/home/surveys"
+
+/** 纯函数版本，便于单测。非问卷回调时返回 null。 */
+internal fun parseSurveyResult(
+    host: String,
+    path: String,
+    query: Map<String, String>
+): SurveyResult? {
+    if (!host.equals(RESULT_HOST, ignoreCase = true)) return null
+    if (path.trimEnd('/') != RESULT_PATH) return null
+
+    val status = query["status"]?.trim()
+    val type = query["type"]?.trim()?.lowercase()
+    val gcRaw = (query["gc"] ?: query["GC"])?.trim()
+    val msgId = query["cpx_message_id"]?.trim()?.takeIf { it.isNotEmpty() }
+
+    // 必须至少命中一个可识别信号，避免劫持正常的浏览导航
+    val recognized = status == "1" || status == "2" ||
+        type == "complete" || type == "out" || msgId != null
+    if (!recognized) return null
+
+    val outcome = when {
+        type == "complete" -> SurveyOutcome.SUCCESS
+        type == "out" -> SurveyOutcome.OUT
+        status == "1" -> SurveyOutcome.SUCCESS
+        status == "2" -> SurveyOutcome.INELIGIBLE
+        else -> SurveyOutcome.NEUTRAL
+    }
+    val checkHistory = gcRaw?.equals("check_history", ignoreCase = true) == true
+    val gcText = if (gcRaw.isNullOrEmpty() || checkHistory) null else gcRaw
+
+    return SurveyResult(
+        outcome = outcome,
+        gcText = gcText,
+        checkHistory = checkHistory,
+        messageId = msgId
+    )
+}
+
+internal fun parseSurveyResultUrl(url: String): SurveyResult? {
+    val u = Uri.parse(url)
+    val host = u.host ?: return null
+    val path = u.path ?: return null
+    val q = HashMap<String, String>()
+    u.queryParameterNames?.forEach { name ->
+        u.getQueryParameter(name)?.let { q[name] = it }
+    }
+    return parseSurveyResult(host, path, q)
+}
+
+/** 顶部状态提示条：按状态着色并展示信息。 */
+@Composable
+private fun SurveyResultBanner(
+    result: SurveyResult,
+    onOpenRating: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val container: Color
+    val onContainer: Color
+    val title: String
+    when (result.outcome) {
+        SurveyOutcome.SUCCESS -> {
+            container = Color(0xFFE3F5E8); onContainer = Color(0xFF1B5E20); title = "问卷已完成"
+        }
+        SurveyOutcome.INELIGIBLE -> {
+            container = Color(0xFFFDE7E6); onContainer = Color(0xFFB3261E); title = "不符合条件"
+        }
+        SurveyOutcome.OUT -> {
+            container = Color(0xFFFFF3E0); onContainer = Color(0xFF8A5300); title = "已退出问卷"
+        }
+        SurveyOutcome.NEUTRAL -> {
+            container = Color(0xFFE8EEF7); onContainer = Color(0xFF274B78); title = "问卷状态更新"
+        }
+    }
+
+    val isCompensation = result.outcome != SurveyOutcome.SUCCESS
+    val amountLine: String? = when {
+        result.checkHistory ->
+            if (isCompensation) "如有补偿，请到「历史记录」查看"
+            else "获得奖励请到「历史记录」查看"
+        result.gcText != null ->
+            if (isCompensation) "补偿 ${result.gcText} GC" else "获得 ${result.gcText} GC"
+        else -> null
+    }
+
+    Surface(color = container, modifier = Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(title, color = onContainer, fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.bodyMedium)
+                if (amountLine != null) {
+                    Spacer(Modifier.height(2.dp))
+                    Text(amountLine, color = onContainer,
+                        style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            result.ratingUrl?.let { url ->
+                TextButton(onClick = { onOpenRating(url) }) {
+                    Text("评价问卷", color = onContainer)
+                }
+            }
+            TextButton(onClick = onDismiss) {
+                Text("✕", color = onContainer)
+            }
+        }
+    }
+}
+
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun SurveyWebScreen(
@@ -140,6 +289,8 @@ fun SurveyWebScreen(
     var loading by remember { mutableStateOf(true) }
     var shownUrl by remember { mutableStateOf(startUrl) }
     var webRef by remember { mutableStateOf<WebView?>(null) }
+    // 问卷完成/退出回调：非空时在顶部展示状态提示条
+    var result by remember { mutableStateOf<SurveyResult?>(null) }
 
     // 注意：必须接收调用方的 modifier（Scaffold 的 innerPadding），
     // 否则本页自己的标题栏会被 Scaffold 顶栏盖住而"消失"。
@@ -151,6 +302,18 @@ fun SurveyWebScreen(
             onRefresh = { webRef?.reload() },
             onClose = onClose
         )
+
+        // 状态提示条（成功 / 不符合条件 / 退出）
+        result?.let { r ->
+            SurveyResultBanner(
+                result = r,
+                onOpenRating = { url ->
+                    result = null
+                    webRef?.loadUrl(url)
+                },
+                onDismiss = { result = null }
+            )
+        }
 
         AndroidView(
             // 占满标题栏以下的剩余空间（不要用 fillMaxSize，否则会超出可视区域）
@@ -173,12 +336,16 @@ fun SurveyWebScreen(
 
                     webViewClient = object : WebViewClient() {
 
-                        // 主框架导航：拦截 & 重写
+                        // 主框架导航：问卷回调拦截 → 状态提示；其它则拦截/重写
                         override fun shouldOverrideUrlLoading(
                             view: WebView?,
                             request: WebResourceRequest?
                         ): Boolean {
                             val u = request?.url?.toString() ?: return false
+                            parseSurveyResultUrl(u)?.let {
+                                result = it
+                                return true          // 不加载目标页，仅在顶部提示
+                            }
                             if (isBlockedSurveyUrl(u)) return true          // 直接拦截，不加载
                             val rw = rewriteSurveyUrl(u)
                             if (rw != u) {
@@ -191,6 +358,10 @@ fun SurveyWebScreen(
                         @Deprecated("Deprecated in Java")
                         override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
                             val u = url ?: return false
+                            parseSurveyResultUrl(u)?.let {
+                                result = it
+                                return true
+                            }
                             if (isBlockedSurveyUrl(u)) return true
                             val rw = rewriteSurveyUrl(u)
                             if (rw != u) {

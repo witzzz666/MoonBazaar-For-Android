@@ -3,6 +3,7 @@ package top.witzzz.moonbazaar.ui
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -109,6 +110,71 @@ class MainViewModel : ViewModel() {
     val accounts: StateFlow<List<Account>> = Session.accounts
     val currentKey: StateFlow<String?> = Session.currentKey
 
+    // ==================================================================
+    // 账号作用域
+    //
+    // 切换账号 / 登出时：取消上一个账号的在途请求，并递增世代号。
+    // 每个请求在发起时快照「世代号 + 令牌」，网络返回后先校验世代号，
+    // 只有仍属于当前账号的响应才允许写入界面状态。
+    //
+    // 为什么不能只靠取消：OkHttp 的 execute() 是阻塞调用，不响应协程取消，
+    // 取消后协程体仍会继续执行到下一个挂起点，所以必须再校验一次世代号。
+    // ==================================================================
+    private var accountGeneration = 0L
+    private val accountJobs = mutableListOf<Job>()
+
+    /** 当前作用域对应的账号令牌，用于发现「账号在别处被改掉」的情况。 */
+    private var scopeToken: String? = null
+
+    /** 使当前账号作用域失效：取消在途请求，并让它们的响应无法再写入界面。 */
+    private fun invalidateAccountScope() {
+        accountJobs.forEach { it.cancel() }
+        accountJobs.clear()
+        accountGeneration++
+        scopeToken = currentToken()
+    }
+
+    private fun isCurrentScope(generation: Long): Boolean = generation == accountGeneration
+
+    /** 当前账号的令牌；未登录（空 / 全空白）时返回 null。 */
+    private fun currentToken(): String? = Session.tokenValue?.takeIf { it.isNotBlank() }
+
+    /**
+     * 每个账号相关请求的入口：返回该请求应绑定的令牌（未登录返回 null）。
+     *
+     * 若发现当前令牌与作用域记录的令牌不一致，说明账号在**别处**被改过
+     * （例如已有账号上「添加账号」成功后 `Session.addAndSelect` 直接切了当前账号），
+     * 此时先作废旧作用域，保证旧账号的在途响应不会写进新账号的界面。
+     */
+    private fun beginAccountRequest(): String? {
+        val token = currentToken()
+        if (token != scopeToken) invalidateAccountScope()
+        return token
+    }
+
+    /**
+     * 账号已变更后的统一收尾：作废旧作用域、清空界面，并按当前是否仍有账号决定重新拉取还是置为登出。
+     * @param note 切换过程中的提示文案
+     */
+    private fun applyAccountChange(note: String) {
+        invalidateAccountScope()
+        clearAccountUiState(note)
+        if (Session.currentKey.value != null) {
+            _auth.value = AuthUi.Unknown
+            refreshAuthState()
+            reloadAll()
+        } else {
+            _auth.value = AuthUi.LoggedOut
+        }
+    }
+
+    /** 在账号作用域内发起请求，回调参数为发起时的世代号。 */
+    private fun launchInAccountScope(block: suspend (Long) -> Unit) {
+        accountJobs.removeAll { it.isCompleted }
+        val generation = accountGeneration
+        accountJobs += viewModelScope.launch(Dispatchers.IO) { block(generation) }
+    }
+
     // ---- transactions (paginated) ----
     data class TxUi(
         val loading: Boolean = false,
@@ -152,16 +218,24 @@ class MainViewModel : ViewModel() {
 
     // ===== 会话 =====
     fun refreshAuthState() {
+        val token = beginAccountRequest()
         _authNote.value = "检查会话…"
-        viewModelScope.launch(Dispatchers.IO) {
-            val (s, err) = MoonRepository.status()
+        launchInAccountScope { generation ->
+            val (s, err) = MoonRepository.status(token)
+            if (!isCurrentScope(generation)) return@launchInAccountScope
             when {
-                s == null -> { _auth.value = AuthUi.LoggedOut; _authNote.value = err.ifEmpty { "无法获取会话" } }
+                s == null -> {
+                    _auth.value = AuthUi.LoggedOut
+                    _authNote.value = err.ifEmpty { "无法获取会话" }
+                }
                 !s.sessionValid || !s.hasTokens -> {
                     _auth.value = AuthUi.LoggedOut
                     _authNote.value = if (s.sessionValid) "已有会话，尚无用户令牌" else "会话无效，请登录"
                 }
-                else -> { _auth.value = AuthUi.LoggedIn; _authNote.value = "已登录" }
+                else -> {
+                    _auth.value = AuthUi.LoggedIn
+                    _authNote.value = "已登录"
+                }
             }
         }
     }
@@ -191,17 +265,15 @@ class MainViewModel : ViewModel() {
     /** 退出当前账号：吊销服务端 session 并移除本地该账号；若还有其它账号则自动切过去。 */
     fun logout() {
         val key = Session.currentKey.value
-        viewModelScope.launch(Dispatchers.IO) {
-            MoonRepository.logout()          // 尽力吊销当前账号的 Worker session
+        val token = Session.tokenValue
+        // 先让旧账号的在途请求全部失效，再发起吊销请求
+        invalidateAccountScope()
+        launchInAccountScope { generation ->
+            MoonRepository.logout(token)     // 用该账号自己的令牌尽力吊销 Worker session
             if (key != null) Session.removeByKey(key) else Session.clear()
-
-            clearAccountUiState("未登录")
-            if (Session.currentKey.value != null) {
-                refreshAuthState()
-                reloadAll()
-            } else {
-                _auth.value = AuthUi.LoggedOut
-            }
+            // 期间用户可能已经切到别的账号：本地已移除，但界面交给新的账号作用域负责
+            if (!isCurrentScope(generation)) return@launchInAccountScope
+            applyAccountChange("未登录")
         }
     }
 
@@ -209,10 +281,8 @@ class MainViewModel : ViewModel() {
     fun switchAccount(key: String) {
         if (key == Session.currentKey.value) return
         Session.selectByKey(key)
-        clearAccountUiState("正在切换账号…")
-        _auth.value = AuthUi.Unknown
-        refreshAuthState()
-        reloadAll()
+        // 切换后立刻作废旧账号的在途请求，避免旧响应覆盖新账号界面
+        applyAccountChange("正在切换账号…")
     }
 
     /** 移除指定账号；若移除的是当前账号会自动切换到其它账号。 */
@@ -220,23 +290,18 @@ class MainViewModel : ViewModel() {
         val wasCurrent = key == Session.currentKey.value
         Session.removeByKey(key)
         if (!wasCurrent) return
-        clearAccountUiState("已移除该账号")
-        if (Session.currentKey.value != null) {
-            _auth.value = AuthUi.Unknown
-            refreshAuthState()
-            reloadAll()
-        } else {
-            _auth.value = AuthUi.LoggedOut
-        }
+        applyAccountChange("已移除该账号")
     }
 
     // ===== 首页 =====
     fun loadHome() {
-        if (!Session.isValid) return
+        val token = beginAccountRequest() ?: return
         _home.value = _home.value.copy(loading = true)
-        viewModelScope.launch(Dispatchers.IO) {
-            val (acct, acctErr) = MoonRepository.accountStatus()
-            val (bal, balErr) = MoonRepository.accountBalance()
+        launchInAccountScope { generation ->
+            val (acct, _) = MoonRepository.accountStatus(token)
+            val (bal, _) = MoonRepository.accountBalance(token)
+            if (!isCurrentScope(generation)) return@launchInAccountScope
+
             val avail = findVal(bal, "available", "available_gascoin", "balance", "gascoin")
             val acctData = acct?.optJSONObject("data") ?: acct
             val banned = acctData?.optBoolean("is_banned", false) == true
@@ -253,9 +318,9 @@ class MainViewModel : ViewModel() {
             )
             _ban.value = BanState(banned = banned, reason = acctInfo.banReason)
             _home.value = HomeUi(loading = false, gc = MoonRepository.gcInteger(avail), account = acctInfo)
-            // 回填账号信息（uid / username），用于账号列表显示
+            // 回填账号信息（uid / username）到**发起该请求的账号**，而不是当前账号
             if (acctInfo.uid.isNotBlank()) {
-                Session.identify(acctInfo.uid, acctInfo.username)
+                Session.identify(token, acctInfo.uid, acctInfo.username)
             }
         }
     }
@@ -270,7 +335,7 @@ class MainViewModel : ViewModel() {
      *               再用 limit=min(total, txCap) 拉取记录。
      */
     fun loadTransactions(offset: Int = 0) {
-        if (!Session.isValid) return
+        val token = beginAccountRequest() ?: return
         if (_ban.value.banned) {
             _tx.value = TxUi(message = _ban.value.reason.ifEmpty { "账号已封禁，无法查看" })
             return
@@ -281,36 +346,38 @@ class MainViewModel : ViewModel() {
             loading = true,
             message = if (offset == 0) "正在获取记录总数…" else cur.message
         )
-        viewModelScope.launch(Dispatchers.IO) {
+        launchInAccountScope { generation ->
             // ① 探测请求：拿总数
             var total = cur.total
             if (offset == 0) {
-                val (probe, probeErr) = MoonRepository.transactions(limit = 1, offset = 0)
+                val (probe, probeErr) = MoonRepository.transactions(limit = 1, offset = 0, token = token)
+                if (!isCurrentScope(generation)) return@launchInAccountScope
                 val pd = probe?.optJSONObject("data") ?: probe
                 if (pd == null) {
                     _tx.value = TxUi(
                         loading = false,
                         message = probeErr.ifEmpty { "无法获取交易记录" }
                     )
-                    return@launch
+                    return@launchInAccountScope
                 }
                 total = pd.optInt("total", 0)
                 if (total <= 0) {
                     _tx.value = TxUi(loading = false, total = 0, hasMore = false,
                         message = "暂无交易记录")
-                    return@launch
+                    return@launchInAccountScope
                 }
             }
 
             // ② 正式请求：limit = min(total, 上限)；翻页时沿用同一页大小
             val pageSize = if (offset == 0) minOf(total, txCap) else cur.limit
-            val (data, err) = MoonRepository.transactions(limit = pageSize, offset = offset)
+            val (data, err) = MoonRepository.transactions(limit = pageSize, offset = offset, token = token)
+            if (!isCurrentScope(generation)) return@launchInAccountScope
             val d = data?.optJSONObject("data") ?: data
             val records = d?.optJSONArray("records")
             if (records == null) {
                 _tx.value = cur.copy(loading = false,
                     message = err.ifEmpty { "暂无交易数据" })
-                return@launch
+                return@launchInAccountScope
             }
             val list = (0 until records.length()).map { i ->
                 val j = records.optJSONObject(i) ?: JSONObject()
@@ -346,9 +413,11 @@ class MainViewModel : ViewModel() {
             return
         }
         if (code.isBlank()) return
+        val token = beginAccountRequest() ?: return
         _redeem.value = RedemptionUiState(submitting = true)
-        viewModelScope.launch(Dispatchers.IO) {
-            val r = MoonRepository.redeemCode(code)
+        launchInAccountScope { generation ->
+            val r = MoonRepository.redeemCode(code, token)
+            if (!isCurrentScope(generation)) return@launchInAccountScope
             val confirmation = r.json?.optJSONObject("data")?.optString("confirmation_url")
                 ?: r.json?.optString("confirmation_url") ?: ""
             _redeem.value = if (r.okHttp) {
@@ -368,16 +437,17 @@ class MainViewModel : ViewModel() {
 
     // ===== referral =====
     fun loadReferral() {
-        if (!Session.isValid) return
+        val token = beginAccountRequest() ?: return
         if (_ban.value.banned) {
             _referral.value = ReferralUiState(
                 message = _ban.value.reason.ifEmpty { "账号已封禁，无法查看" })
             return
         }
         _referral.value = _referral.value.copy(loading = true)
-        viewModelScope.launch(Dispatchers.IO) {
+        launchInAccountScope { generation ->
             // 邀请链接（uid_link 必有；custom_link 可能未设置）
-            val (linkData, linkErr) = MoonRepository.referralLink()
+            val (linkData, linkErr) = MoonRepository.referralLink(token)
+            if (!isCurrentScope(generation)) return@launchInAccountScope
             val ld = linkData?.optJSONObject("data") ?: linkData
             val uidLink = ld?.optString("uid_link").orEmpty()
             val customCode = ld?.optString("custom_code").orEmpty()
@@ -389,7 +459,8 @@ class MainViewModel : ViewModel() {
             var commission = ""
             var listErrMsg = ""
 
-            val (probe, probeErr) = MoonRepository.referrals(limit = 1, offset = 0)
+            val (probe, probeErr) = MoonRepository.referrals(limit = 1, offset = 0, token = token)
+            if (!isCurrentScope(generation)) return@launchInAccountScope
             val pd = probe?.optJSONObject("data") ?: probe
             if (pd == null) {
                 listErrMsg = probeErr.ifEmpty { "无法获取邀请数据" }
@@ -398,7 +469,8 @@ class MainViewModel : ViewModel() {
                 commission = numberText(pd.opt("commission_earned_gc"))
                 if (totalInvites > 0) {
                     val pageSize = minOf(totalInvites, refCap)
-                    val (listData, listErr) = MoonRepository.referrals(limit = pageSize, offset = 0)
+                    val (listData, listErr) = MoonRepository.referrals(limit = pageSize, offset = 0, token = token)
+                    if (!isCurrentScope(generation)) return@launchInAccountScope
                     val d = listData?.optJSONObject("data") ?: listData
                     val arr = d?.optJSONArray("invites")
                     if (arr == null) {
@@ -437,20 +509,21 @@ class MainViewModel : ViewModel() {
 
     // ===== 主要问卷 =====
     fun loadSurveys() {
-        if (!Session.isValid) return
+        val token = beginAccountRequest() ?: return
         if (_ban.value.banned) {
             _surveys.value = SurveysUiState(
                 message = _ban.value.reason.ifEmpty { "账号已封禁，无法查看问卷" })
             return
         }
         _surveys.value = _surveys.value.copy(loading = true, message = "")
-        viewModelScope.launch(Dispatchers.IO) {
-            val (data, err) = MoonRepository.surveys()
+        launchInAccountScope { generation ->
+            val (data, err) = MoonRepository.surveys(token)
+            if (!isCurrentScope(generation)) return@launchInAccountScope
             val d = data?.optJSONObject("data") ?: data
             if (d == null) {
                 _surveys.value = SurveysUiState(loading = false,
                     message = err.ifEmpty { "无法获取问卷" })
-                return@launch
+                return@launchInAccountScope
             }
             val country = d.optString("country_code")
             val quality = d.optInt("quality_score", 0)
@@ -504,21 +577,22 @@ class MainViewModel : ViewModel() {
 
     // ===== withdraw products =====
     fun loadProducts() {
-        if (!Session.isValid) return
+        val token = beginAccountRequest() ?: return
         if (_ban.value.banned) {
             _products.value = emptyList()
             _withdrawMsg.value = _ban.value.reason.ifEmpty { "账号已封禁，无法提现" }
             return
         }
-        viewModelScope.launch(Dispatchers.IO) {
+        launchInAccountScope { generation ->
             _withdrawMsg.value = "加载中…"
-            val (data, err) = MoonRepository.products()
+            val (data, err) = MoonRepository.products(token)
+            if (!isCurrentScope(generation)) return@launchInAccountScope
             val d = data?.optJSONObject("data") ?: data
             val methods = d?.optJSONArray("methods")
             if (methods == null) {
                 _products.value = emptyList()
                 _withdrawMsg.value = err.ifEmpty { (d?.toString(2)) ?: "无提现产品" }
-                return@launch
+                return@launchInAccountScope
             }
             val out = mutableListOf<WithdrawProduct>()
             for (m in 0 until methods.length()) {
@@ -570,13 +644,15 @@ class MainViewModel : ViewModel() {
             _withdrawMsg.value = "该产品按数量/金额计，请填写金额。"
             return
         }
+        val token = beginAccountRequest() ?: return
         // 发送时固定价可不传 amount，rate 必传
-        viewModelScope.launch(Dispatchers.IO) {
+        launchInAccountScope { generation ->
             _withdrawMsg.value = "提交中…"
             val r = MoonRepository.submitWithdrawal(
                 product.id,
                 if (product.pricingType == "rate") amount else null,
-                delivery, note.ifBlank { null })
+                delivery, note.ifBlank { null }, token)
+            if (!isCurrentScope(generation)) return@launchInAccountScope
             val st = findStr(r.json, "status") ?: "已提交"
             _withdrawMsg.value = if (r.okHttp) "✅ 已提交，状态 $st\n${r.body}"
             else "❌ ${r.errorMsg}\n${r.body}"

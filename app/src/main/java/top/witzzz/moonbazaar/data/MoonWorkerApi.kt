@@ -51,30 +51,46 @@ class MoonWorkerApi {
     }
 
     /** Worker 自带的只读接口（如 /status、/user/tokens）。 */
-    fun get(path: String): CallResult = exec("GET", path, null, null)
+    fun get(path: String, token: String? = null): CallResult = exec("GET", path, null, null, token)
 
     /** Worker 自带写接口（如 DELETE /user/tokens 登出）。 */
-    fun del(path: String): CallResult = exec("DELETE", path, null, null)
+    fun del(path: String, token: String? = null): CallResult = exec("DELETE", path, null, null, token)
 
     /** 经 Worker 代理的只读 GET：path 不带 /proxy 前缀，如 account/status。 */
-    fun proxyGet(path: String): CallResult = exec("GET", "/proxy/$path", null, null)
+    fun proxyGet(path: String, token: String? = null): CallResult =
+        exec("GET", "/proxy/$path", null, null, token)
 
     /** 经 Worker 代理的写操作，body 可为 null，需幂等键。path 不带 /proxy。 */
-    fun proxyPost(path: String, body: JSONObject?, idempotencyKey: String): CallResult =
-        exec("POST", "/proxy/$path", body, idempotencyKey)
+    fun proxyPost(
+        path: String,
+        body: JSONObject?,
+        idempotencyKey: String,
+        token: String? = null
+    ): CallResult = exec("POST", "/proxy/$path", body, idempotencyKey, token)
 
     /** 经 Worker 代理、**无需幂等键**的写操作（如 account/email-verification）。 */
-    fun proxyPostNoIdem(path: String, body: JSONObject?): CallResult =
-        exec("POST", "/proxy/$path", body, null)
+    fun proxyPostNoIdem(path: String, body: JSONObject?, token: String? = null): CallResult =
+        exec("POST", "/proxy/$path", body, null, token)
 
-    private fun exec(method: String, urlPath: String, body: JSONObject?, idem: String?): CallResult {
+    /**
+     * @param token 该请求所属账号的 session token。由调用方在**发起时**快照传入，
+     *              避免请求真正执行时账号已被切换、从而把 A 的操作发到 B 名下。
+     *              为 null 时退回使用当前全局 session。
+     */
+    private fun exec(
+        method: String,
+        urlPath: String,
+        body: JSONObject?,
+        idem: String?,
+        token: String? = null
+    ): CallResult {
         return try {
             val url = AppConfig.BASE_URL.trimEnd('/') + urlPath
             val b = Request.Builder()
                 .url(url)
                 .header("X-Source-App", AppConfig.SOURCE_APP)
                 .header("Accept", "application/json")
-            val sess = Session.tokenValue
+            val sess = token ?: Session.tokenValue
             if (sess != null) b.header("X-Client-Session", sess)
             if (idem != null) b.header("Idempotency-Key", idem)
 

@@ -110,6 +110,14 @@ android {
                 enable = false
             }
         }
+
+        debug {
+            // 仅 debug 变体额外带上模拟器可用的 ABI（x86_64 / x86）。
+            // 原因：flavor 按 ABI 分包后，若 IDE 选中 arm32Debug，
+            // 在 x86_64 模拟器上会因 ABI 不兼容而无法安装，导致无法直接调试。
+            // release 不受影响，仍严格按 flavor 的 ABI 分包。
+            ndk { abiFilters += listOf("x86_64", "x86") }
+        }
     }
 
     compileOptions {

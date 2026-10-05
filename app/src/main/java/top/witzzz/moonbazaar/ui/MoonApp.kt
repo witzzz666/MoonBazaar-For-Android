@@ -75,7 +75,6 @@ fun MoonApp(
 ) {
     var tabIndex by rememberSaveable { mutableIntStateOf(0) }
     val tabs = Tab.entries
-    val auth by vm.auth.collectAsState()
     val ban by vm.ban.collectAsState()
     val accounts by vm.accounts.collectAsState()
     val currentKey by vm.currentKey.collectAsState()
@@ -89,9 +88,10 @@ fun MoonApp(
         if (drawerState.isOpen) drawerState.close()
     }
 
-    LaunchedEffect(auth) {
-        if (auth is AuthUi.LoggedIn) vm.reloadAll()
-    }
+    // 注意：不要在这里监听 auth 变化去 reloadAll()。
+    // 所有会把状态推到「已登录」的入口（登录、切换账号、登出、移除账号、初始化）
+    // 都已经显式调用过 reloadAll()，再监听一次会导致每次切号都重复发一轮请求，
+    // 反而放大旧响应与新账号交错的窗口。账号切换的时序由 ViewModel 的账号作用域统一保证。
     LaunchedEffect(ban.banned) {
         if (ban.banned) vm.loadHome()
     }
