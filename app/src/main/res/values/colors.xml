@@ -7,4 +7,7 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+
+    <!-- 自适应图标背景：与原图一致（紫环 + 辉光落在白色底上） -->
+    <color name="ic_launcher_background">#FFFFFFFF</color>
 </resources>

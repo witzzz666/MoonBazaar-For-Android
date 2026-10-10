@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标：白色背景 + 紫环/黑圆/六边形前景（foreground 按各密度原生渲染）。
+  前景内容已缩放到 66dp keyline 之内，任意形状的启动器遮罩都不会裁掉紫环。
+  未提供 monochrome 图层：主题化图标会回退使用本图标，而不是把彩色图当单色层用。
+-->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-    <background android:drawable="@drawable/ic_launcher_background" />
+    <background android:drawable="@color/ic_launcher_background" />
     <foreground android:drawable="@drawable/ic_launcher_foreground" />
-    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
 </adaptive-icon>
