@@ -5,10 +5,12 @@ name: Build APK
 #   - 任务名 assemble<Flavor>Release / bundle<Flavor>Release
 #   - 通过 -PsignMode / -PversionCode / -PversionName 传入
 #   - build.gradle.kts 的 collectDist 会把产物汇总到 build/dist
+#
+# 只做「构建 + 上传 artifact」，不会自动创建 GitHub Release：
+# 需要发布时手动把 build/dist 里的产物上传即可。
 on:
   push:
     branches: [main, master]
-    tags: ['v*']
   pull_request:
     branches: [main, master]
   workflow_dispatch:
@@ -188,29 +190,3 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # 打 tag（v*）时把产物挂到 GitHub Release 上
-  release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Publish release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          ls -lh dist
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-          || gh release upload "$GITHUB_REF_NAME" dist/* --clobber
