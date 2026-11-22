@@ -598,43 +598,27 @@ class MainViewModel : ViewModel() {
         }
         _surveys.value = _surveys.value.copy(loading = true, message = "")
         launchInAccountScope { generation ->
-            // 优先直连官网 get_surveys.php（zlex_token + PHPSESSID，与网页端同源数据）；
-            // 官网凭证缺失/失效时回退到 Worker 代理，保证功能可用。
-            val siteToken = Session.accountFor(token)?.siteToken.orEmpty()
-            var used = "worker"
+            // 只走官网直连 get_surveys.php（zlex_token + PHPSESSID，与网页端同源数据）；
+            // 失败就报错，不回退 Worker 代理。
+            val used = "site"
             var data: JSONObject? = null
             var err = ""
-            if (siteToken.isNotBlank()) {
-                used = "site"
-                // 官网凭证每小时轮换：陈旧就先访问 /home 换一份，再请求。
-                SiteRefresh.refreshIfStale()
-                var acct = Session.accountFor(token)
-                var r = MoonRepository.siteSurveys(
+            // 官网凭证每小时轮换：陈旧就先访问 /home 换一份，再请求。
+            SiteRefresh.refreshIfStale()
+            var acct = Session.accountFor(token)
+            var r = MoonRepository.siteSurveys(
+                acct?.siteToken.orEmpty(), acct?.siteSession.orEmpty())
+            if (r.first == null) {
+                Log.w("SiteSurveys", "retry after refresh: ${r.second}")
+                SiteRefresh.refresh(minGapMs = 0L)
+                acct = Session.accountFor(token)
+                r = MoonRepository.siteSurveys(
                     acct?.siteToken.orEmpty(), acct?.siteSession.orEmpty())
-                if (r.first == null) {
-                    Log.w("SiteSurveys", "retry after refresh: ${r.second}")
-                    SiteRefresh.refresh()
-                    acct = Session.accountFor(token)
-                    r = MoonRepository.siteSurveys(
-                        acct?.siteToken.orEmpty(), acct?.siteSession.orEmpty())
-                }
-                data = r.first
-                err = r.second
-            } else {
-                val r = MoonRepository.surveys(token)
-                data = r.first
-                err = r.second
             }
-            if (data == null && siteToken.isNotBlank()) {
-                Log.w("SiteSurveys", "fallback to worker: $err")
-                used = "worker"
-                val fb = MoonRepository.surveys(token)
-                data = fb.first
-                err = fb.second
-            }
+            data = r.first
+            err = r.second
             if (!isCurrentScope(generation)) return@launchInAccountScope
-            // 两种来源：Worker 代理 = {ok, data:{surveys:[…]}}；
-            // 官网直连 = {status:"success", country_code, cpx_enabled, …, data:[…]}。
+            // 官网直连：{status:"success", country_code, cpx_enabled, …, data:[…]}
             val env = data?.optJSONObject("data") ?: data
             val items = env?.optJSONArray("surveys") ?: data?.optJSONArray("data")
             if (env == null) {

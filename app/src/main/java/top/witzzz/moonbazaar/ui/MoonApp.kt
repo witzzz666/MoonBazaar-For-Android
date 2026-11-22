@@ -42,6 +42,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -58,7 +59,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.os.SystemClock
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import kotlinx.coroutines.launch
 import top.witzzz.moonbazaar.data.Account
 import top.witzzz.moonbazaar.data.AppConfig
@@ -84,6 +87,23 @@ fun MoonApp(
     val drawerState = remember { DrawerState(DrawerValue.Closed) }
     val scope = rememberCoroutineScope()
     val current = accounts.firstOrNull { it.key == currentKey }
+    val ctx = LocalContext.current
+
+    // 返回键：抽屉开着先关抽屉；否则要连按两次才退出（第一次提示）。
+    var lastBackAt by remember { mutableLongStateOf(0L) }
+    BackHandler {
+        if (drawerState.isOpen) {
+            scope.launch { drawerState.close() }
+        } else {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastBackAt in 1..2000) {
+                (ctx as? android.app.Activity)?.finish()
+            } else {
+                lastBackAt = now
+                Toast.makeText(ctx, "再返回一次退出MoonBazaar", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
 
     // 双保险：首帧若为展开则立即关闭
     LaunchedEffect(Unit) {
@@ -392,6 +412,11 @@ private fun SurveysScreen(vm: MainViewModel, modifier: Modifier) {
     val running = activeSurvey
 
     if (running != null) {
+        // 问卷 WebView 打开时，返回键先关问卷，不触发「再按一次退出」。
+        BackHandler {
+            activeSurvey = null
+            vm.loadSurveys()
+        }
         SurveyWebScreen(
             startUrl = running,
             onClose = {

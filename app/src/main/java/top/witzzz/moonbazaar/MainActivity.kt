@@ -25,6 +25,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import top.witzzz.moonbazaar.data.AppConfig
 import top.witzzz.moonbazaar.data.Session
 import top.witzzz.moonbazaar.data.SiteCookie
+import top.witzzz.moonbazaar.data.SiteRefresh
 import top.witzzz.moonbazaar.data.isTrustedCallbackUri
 import top.witzzz.moonbazaar.ui.MainViewModel
 import top.witzzz.moonbazaar.ui.MoonApp
@@ -64,6 +65,12 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         captureSessionFromIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 每次打开/切回前台：后台访问一次官网 /home，取回新的 zlex_token 与 PHPSESSID。
+        SiteRefresh.onForeground()
     }
 
     @Composable
