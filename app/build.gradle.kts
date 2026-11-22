@@ -158,6 +158,9 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.androidx.browser)
     testImplementation(libs.junit)
+    // 单元测试跑在 JVM 上，android.jar 里的 org.json 只是抛 "Stub!" 的壳；
+    // 引入真实实现才能测 /home/mb_token 的 JSON 解析。
+    testImplementation("org.json:json:20240303")
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)

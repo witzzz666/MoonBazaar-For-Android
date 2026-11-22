@@ -24,6 +24,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import top.witzzz.moonbazaar.data.AppConfig
 import top.witzzz.moonbazaar.data.Session
+import top.witzzz.moonbazaar.data.SiteCookie
 import top.witzzz.moonbazaar.data.isTrustedCallbackUri
 import top.witzzz.moonbazaar.ui.MainViewModel
 import top.witzzz.moonbazaar.ui.MoonApp
@@ -93,6 +94,8 @@ class MainActivity : ComponentActivity() {
                             showLogin = false
                             loginRequested = false
                             Session.addAndSelect(token)
+                            // 登录流程里站点可能已经下发官网 Cookie，顺手保存（没有则忽略）
+                            SiteCookie.sync()
                             viewModel.refreshAuthState()
                             viewModel.reloadAll()
                         },
@@ -118,6 +121,7 @@ class MainActivity : ComponentActivity() {
         // 消费掉本次登录状态，使同一回调无法被重放
         loginRequested = false
         Session.addAndSelect(token)
+        SiteCookie.sync()
         viewModel.refreshAuthState()
         viewModel.reloadAll()
     }

@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -23,6 +24,13 @@ object AppConfig {
     // Host without scheme, used to detect /auth/done page inside the login WebView.
     const val BASE_HOST: String = "mnb.witzzz.top"
 
+    // 官网（App 内 WebView 打开，和登录流程共用 Cookie）
+    const val SITE_URL: String = "https://moonbazaar.xyz"
+    const val SITE_HOME_URL: String = "$SITE_URL/home"
+
+    // 官网问卷列表接口（PowerShell/PHP 端点，用 zlex_token + PHPSESSID 鉴权，不经 Worker）
+    const val SITE_SURVEYS_URL: String = "$SITE_HOME_URL/get_surveys.php"
+
     // Custom-scheme callback resuming the app after OAuth.
     const val CALLBACK_URI: String = "mnb://auth/callback"
 
@@ -36,11 +44,23 @@ object AppConfig {
     const val SOURCE_APP: String = "android"
 }
 
-/** 一个已登录的账号（保存它的 Worker session token）。 */
+/**
+ * 一个已登录的账号。
+ *
+ * 同一个账号会同时保存三套凭证，彼此独立、互不覆盖：
+ * - [token]：Worker 的 X-Client-Session（调 API 用）；
+ * - [siteToken] / [siteSession]：官网 moonbazaar.xyz 的 `zlex_token` 与 `PHPSESSID` Cookie（直连官网问卷接口用）；
+ * - [mbAccessToken] / [mbRefreshToken] / [mbExpiresAt]：`GET /home/mb_token` 申请的 OAuth token（expiresAt 为服务器给的秒级时间戳）。
+ */
 data class Account(
     val uid: String = "",
     val username: String = "",
-    val token: String = ""
+    val token: String = "",
+    val siteToken: String = "",
+    val siteSession: String = "",
+    val mbAccessToken: String = "",
+    val mbRefreshToken: String = "",
+    val mbExpiresAt: Long = 0L
 ) {
     /** 稳定主键：优先 UID；登录早期还没拿到 UID 时用 token 前缀。 */
     val key: String
@@ -52,6 +72,10 @@ data class Account(
             uid.isNotBlank() -> "UID $uid"
             else -> "未命名账号"
         }
+
+    val hasSiteToken: Boolean get() = siteToken.isNotBlank()
+    val hasSiteSession: Boolean get() = siteSession.isNotBlank()
+    val hasMbToken: Boolean get() = mbAccessToken.isNotBlank()
 }
 
 /**
@@ -277,6 +301,85 @@ object Session {
         _token.value = null
     }
 
+    /** 当前账号在官网 WebView 里拿到的 zlex_token（没有则 null）。 */
+    val currentSiteToken: String?
+        get() = currentAccount?.siteToken?.takeIf { it.isNotBlank() }
+
+    /** 当前账号在官网的 PHPSESSID（没有则 null）。 */
+    val currentSiteSession: String?
+        get() = currentAccount?.siteSession?.takeIf { it.isNotBlank() }
+
+    /** 按 session token 取账号（请求发起时的快照，避免中途切换账号读错人）。 */
+    fun accountFor(sessionToken: String?): Account? {
+        val t = sessionToken ?: return currentAccount
+        return _accounts.value.firstOrNull { it.token == t }
+    }
+
+    /**
+     * 保存某个账号在官网 moonbazaar.xyz 拿到的 `zlex_token` 和 `PHPSESSID`。
+     *
+     * 与 Worker session token 并存保存，不互相覆盖——两者是不同体系的凭证。
+     * [sessionToken] 为空时表示当前账号；传入发起请求时的 token 可避免切换账号后写错人。
+     */
+    fun updateSiteCredentials(
+        siteToken: String,
+        siteSession: String = "",
+        sessionToken: String? = null
+    ) {
+        val v = siteToken.trim()
+        if (v.isBlank()) return
+        val s = siteSession.trim()
+        updateAccount(sessionToken) {
+            it.copy(
+                siteToken = v,
+                siteSession = s.ifBlank { it.siteSession }
+            )
+        }
+    }
+
+    /** 兼容旧调用：只更新 zlex_token。 */
+    fun updateSiteToken(siteToken: String, sessionToken: String? = null) {
+        updateSiteCredentials(siteToken, "", sessionToken)
+    }
+
+    /** 保存某个账号的 `/home/mb_token` 结果（access / refresh / 过期时间）。 */
+    fun updateMbToken(
+        accessToken: String,
+        refreshToken: String,
+        expiresAt: Long,
+        sessionToken: String? = null
+    ) {
+        if (accessToken.isBlank()) return
+        updateAccount(sessionToken) {
+            it.copy(
+                mbAccessToken = accessToken,
+                mbRefreshToken = refreshToken.ifBlank { it.mbRefreshToken },
+                mbExpiresAt = expiresAt
+            )
+        }
+    }
+    /** 按 session token 定位账号并改写它；当前账号与 token 流保持不变。 */
+    private fun updateAccount(sessionToken: String?, transform: (Account) -> Account) {
+        val p = prefs ?: return
+        val t = sessionToken ?: _token.value ?: return
+        val list = _accounts.value.toMutableList()
+        val idx = list.indexOfFirst { it.token == t }
+        if (idx < 0) return
+        val untouched = list[idx]
+        val updated = transform(untouched)
+        if (updated == untouched) return
+        list[idx] = updated
+        persist(p, list, _currentKey.value)
+        _accounts.value = list
+        // 只记录「存了哪一类凭证」，不打印 token 本体
+        Log.i(
+            "Account",
+            "saved ${updated.key} site=${updated.siteToken != untouched.siteToken} " +
+                "sess=${updated.siteSession != untouched.siteSession} " +
+                "mb=${updated.mbAccessToken != untouched.mbAccessToken}"
+        )
+    }
+
     private fun readAccounts(p: SharedPreferences): List<Account> {
         val raw = p.getString(KEY_ACCOUNTS, null) ?: return emptyList()
         // 新格式：Keystore 加密；旧格式：明文 JSON（首次读取时自动迁移）。
@@ -286,7 +389,9 @@ object Session {
         return parseAccounts(plain)
     }
 
-    private fun parseAccounts(raw: String): List<Account> {
+    private fun parseAccounts(raw: String): List<Account> = decodeAccounts(raw)
+
+    internal fun decodeAccounts(raw: String): List<Account> {
         return try {
             val arr = JSONArray(raw)
             (0 until arr.length()).mapNotNull { i ->
@@ -296,7 +401,12 @@ object Session {
                 else Account(
                     uid = o.optString("uid"),
                     username = o.optString("username"),
-                    token = token
+                    token = token,
+                    siteToken = o.optString("site_token"),
+                    siteSession = o.optString("site_session"),
+                    mbAccessToken = o.optString("mb_access_token"),
+                    mbRefreshToken = o.optString("mb_refresh_token"),
+                    mbExpiresAt = o.optLong("mb_expires_at", 0L)
                 )
             }
         } catch (_: Exception) {
@@ -304,7 +414,8 @@ object Session {
         }
     }
 
-    private fun persist(p: SharedPreferences, list: List<Account>, current: String?) {
+    /** 账号列表 → 明文 JSON（三套 token 都写进去，由调用方负责加密）。 */
+    internal fun encodeAccounts(list: List<Account>): String {
         val arr = JSONArray()
         list.forEach { a ->
             arr.put(
@@ -312,13 +423,22 @@ object Session {
                     put("uid", a.uid)
                     put("username", a.username)
                     put("token", a.token)
+                    put("site_token", a.siteToken)
+                    put("site_session", a.siteSession)
+                    put("mb_access_token", a.mbAccessToken)
+                    put("mb_refresh_token", a.mbRefreshToken)
+                    put("mb_expires_at", a.mbExpiresAt)
                 }
             )
         }
+        return arr.toString()
+    }
+
+    private fun persist(p: SharedPreferences, list: List<Account>, current: String?) {
         val editor = p.edit().putString(KEY_CURRENT, current)
         // 加密失败时宁可不落盘，也不把明文 token 写进 SharedPreferences。
         val encrypted = try {
-            SessionCrypto.encrypt(arr.toString())
+            SessionCrypto.encrypt(encodeAccounts(list))
         } catch (_: Exception) {
             null
         }

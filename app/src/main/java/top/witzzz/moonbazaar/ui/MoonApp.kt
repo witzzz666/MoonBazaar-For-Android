@@ -62,6 +62,7 @@ import android.widget.Toast
 import kotlinx.coroutines.launch
 import top.witzzz.moonbazaar.data.Account
 import top.witzzz.moonbazaar.data.AppConfig
+import top.witzzz.moonbazaar.data.SiteCookie
 
 private enum class Tab(val label: String) {
     Home("首页"), Surveys("问卷"), Tx("交易"), Redeem("兑换"), Referral("邀请"), Withdraw("提现")
@@ -78,6 +79,7 @@ fun MoonApp(
     val ban by vm.ban.collectAsState()
     val accounts by vm.accounts.collectAsState()
     val currentKey by vm.currentKey.collectAsState()
+    val mb by vm.mbToken.collectAsState()
     // 不用 rememberSaveable：每次重建都从「关闭」开始，避免恢复上次展开状态而被自动打开
     val drawerState = remember { DrawerState(DrawerValue.Closed) }
     val scope = rememberCoroutineScope()
@@ -86,6 +88,9 @@ fun MoonApp(
     // 双保险：首帧若为展开则立即关闭
     LaunchedEffect(Unit) {
         if (drawerState.isOpen) drawerState.close()
+        // 启动时补抓一次官网 Cookie（zlex_token + PHPSESSID）：登录时的 WebView 已经把它们写进
+        // CookieManager，这里只是从本地读回来存档，供「问卷」直连官网接口使用。
+        SiteCookie.sync()
     }
 
     // 注意：不要在这里监听 auth 变化去 reloadAll()。
@@ -195,6 +200,21 @@ fun MoonApp(
                                 scope.launch { drawerState.close() }
                             },
                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp)
+                        )
+                    }
+
+                    // 启动时申请的 MoonBazaar 官方 token（只显示状态，不显示 token 本体）
+                    Spacer(Modifier.height(8.dp))
+                    HorizontalDivider()
+                    Column(Modifier.padding(horizontal = 28.dp, vertical = 8.dp)) {
+                        Text("MoonBazaar Token",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary)
+                        Text(
+                            mbTokenLine(mb),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (mb.ok) MaterialTheme.colorScheme.outline
+                            else MaterialTheme.colorScheme.error
                         )
                     }
                     Spacer(Modifier.height(12.dp))
@@ -468,7 +488,7 @@ private fun SurveyCard(item: SurveyItem, onStart: (String) -> Unit) {
     }
 }
 
-// =============================== 交易流水（分页，单条）
+// =============================== 交易流水（分页，单条卡片）
 @Composable
 private fun TransactionsScreen(vm: MainViewModel, modifier: Modifier) {
     val tx by vm.tx.collectAsState()
@@ -935,6 +955,33 @@ internal fun JsonBox(title: String, text: String) {
                 OutlinedButton(onClick = { open = !open }) { Text(if (open) "收起" else "展开") }
             }
         }
+    }
+}
+
+/** 侧边栏里 MoonBazaar token 的一行状态（不展示 token 本体）。 */
+private fun mbTokenLine(m: MbTokenUi): String = when {
+    m.loading -> "申请中…"
+    m.ok -> buildString {
+        append(if (m.expired) "已过期" else "已获取")
+        val left = remainText(m.expiresAt)
+        if (left.isNotBlank()) append(" · ").append(left)
+        if (m.scopeCount > 0) append(" · ").append(m.scopeCount).append(" 项权限")
+        if (m.hasRefresh) append(" · 可本地续期")
+    }
+    m.message.isNotBlank() -> m.message
+    else -> "未申请"
+}
+
+/** 把 expires_at（毫秒时间戳）转成粗略的剩余时长。 */
+private fun remainText(expiresAt: Long): String {
+    if (expiresAt <= 0L) return ""
+    val ms = expiresAt - System.currentTimeMillis()
+    if (ms <= 0L) return "已过期"
+    val minutes = ms / 60_000L
+    return when {
+        minutes >= 1440L -> "剩余 ${minutes / 1440L} 天"
+        minutes >= 60L -> "剩余 ${minutes / 60L} 小时"
+        else -> "剩余 ${minutes.coerceAtLeast(1L)} 分钟"
     }
 }
 

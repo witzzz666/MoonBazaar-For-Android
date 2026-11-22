@@ -2,6 +2,7 @@ package top.witzzz.moonbazaar.ui
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -10,8 +11,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import top.witzzz.moonbazaar.data.Account
+import top.witzzz.moonbazaar.data.MbTokenStore
 import top.witzzz.moonbazaar.data.MoonRepository
 import top.witzzz.moonbazaar.data.Session
+import top.witzzz.moonbazaar.data.SiteRefresh
 
 // 登录/会话
 sealed class AuthUi {
@@ -91,6 +94,23 @@ data class SurveysUiState(
     val countryCode: String = "",
     val qualityScore: Int = 0,
     val surveys: List<SurveyItem> = emptyList()
+)
+
+/**
+ * 启动时向 Worker 申请的 MoonBazaar 官方 token（GET /home/mb_token）。
+ *
+ * 这里只记录「拿没拿到、什么时候过期」这类可展示信息，
+ * token 本体放在 [top.witzzz.moonbazaar.data.MbTokenStore] 内存里，不进 UI 状态、不落盘。
+ */
+data class MbTokenUi(
+    val loading: Boolean = false,
+    val ok: Boolean = false,
+    val uid: String = "",
+    val expiresAt: Long = 0L,
+    val expired: Boolean = false,
+    val hasRefresh: Boolean = false,
+    val scopeCount: Int = 0,
+    val message: String = ""
 )
 
 class MainViewModel : ViewModel() {
@@ -207,6 +227,10 @@ class MainViewModel : ViewModel() {
     private val _surveys = MutableStateFlow(SurveysUiState())
     val surveys: StateFlow<SurveysUiState> = _surveys.asStateFlow()
 
+    // ---- MoonBazaar token（每次启动申请一次） ----
+    private val _mbToken = MutableStateFlow(MbTokenUi())
+    val mbToken: StateFlow<MbTokenUi> = _mbToken.asStateFlow()
+
     init {
         refreshAuthState()
         loadHome()
@@ -214,6 +238,7 @@ class MainViewModel : ViewModel() {
         loadTransactions(0)
         loadReferral()
         loadProducts()
+        fetchMbToken()
     }
 
     // ===== 会话 =====
@@ -240,9 +265,62 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    // ===== MoonBazaar token =====
+
+    /**
+     * 启动时向 Worker 申请 MoonBazaar 官方 token（`GET /home/mb_token`）。
+     *
+     * - 每次 App 启动（ViewModel 创建）都会调用一次；登录 / 切换账号后 [reloadAll] 也会再调用，
+     *   保证内存里的 token 始终属于当前账号。
+     * - 只放内存（[MbTokenStore]），不写 SharedPreferences、不打印明文。
+     * - 失败（会话过期 / 尚未完成 OAuth）只记录提示，不打断其它页面的加载。
+     */
+    fun fetchMbToken() {
+        val token = beginAccountRequest()
+        if (token == null) {
+            _mbToken.value = MbTokenUi()
+            MbTokenStore.clear()
+            return
+        }
+        _mbToken.value = _mbToken.value.copy(loading = true)
+        launchInAccountScope { generation ->
+            val (t, err) = MoonRepository.mbToken(token)
+            if (!isCurrentScope(generation)) return@launchInAccountScope
+            if (t == null) {
+                MbTokenStore.clear()
+                _mbToken.value = MbTokenUi(
+                    loading = false,
+                    message = err.ifEmpty { "获取 MoonBazaar Token 失败" }
+                )
+                Log.w("MbToken", "fetch failed: ${err.take(200)}")
+                return@launchInAccountScope
+            }
+            MbTokenStore.update(t)
+            // 与 session token / 官网 zlex_token 一起按账号存档，重启后仍能对得上
+            Session.updateMbToken(
+                accessToken = t.accessToken,
+                refreshToken = t.refreshToken,
+                expiresAt = t.expiresAt,
+                sessionToken = token
+            )
+            _mbToken.value = MbTokenUi(
+                loading = false,
+                ok = true,
+                uid = t.uid,
+                expiresAt = t.expiresAt,
+                expired = t.expired,
+                hasRefresh = t.refreshToken.isNotBlank(),
+                scopeCount = t.scopeCount,
+                message = if (t.expired) "Token 已过期" else "已获取"
+            )
+            // 只记录元信息，绝不打印 token 本身
+            Log.i("MbToken", "ok uid=${t.uid} scope=${t.scopeCount} " +
+                "expired=${t.expired} refresh=${t.refreshToken.isNotBlank()}")
+        }
+    }
+
     /** 清空所有与账号相关的界面数据（切换账号 / 登出时必须调用，否则会残留上一个账号的信息）。 */
-    private fun clearAccountUiState(note: String) {
-        _home.value = HomeUi()
+    private fun clearAccountUiState(note: String) {        _home.value = HomeUi()
         _ban.value = BanState()
         _tx.value = TxUi()
         _redeem.value = RedemptionUiState()
@@ -250,6 +328,8 @@ class MainViewModel : ViewModel() {
         _products.value = emptyList()
         _withdrawMsg.value = ""
         _surveys.value = SurveysUiState()
+        _mbToken.value = MbTokenUi()
+        MbTokenStore.clear()
         _authNote.value = note
     }
 
@@ -260,6 +340,7 @@ class MainViewModel : ViewModel() {
         loadTransactions(0)
         loadReferral()
         loadProducts()
+        fetchMbToken()
     }
 
     /** 退出当前账号：吊销服务端 session 并移除本地该账号；若还有其它账号则自动切过去。 */
@@ -517,30 +598,72 @@ class MainViewModel : ViewModel() {
         }
         _surveys.value = _surveys.value.copy(loading = true, message = "")
         launchInAccountScope { generation ->
-            val (data, err) = MoonRepository.surveys(token)
+            // 优先直连官网 get_surveys.php（zlex_token + PHPSESSID，与网页端同源数据）；
+            // 官网凭证缺失/失效时回退到 Worker 代理，保证功能可用。
+            val siteToken = Session.accountFor(token)?.siteToken.orEmpty()
+            var used = "worker"
+            var data: JSONObject? = null
+            var err = ""
+            if (siteToken.isNotBlank()) {
+                used = "site"
+                // 官网凭证每小时轮换：陈旧就先访问 /home 换一份，再请求。
+                SiteRefresh.refreshIfStale()
+                var acct = Session.accountFor(token)
+                var r = MoonRepository.siteSurveys(
+                    acct?.siteToken.orEmpty(), acct?.siteSession.orEmpty())
+                if (r.first == null) {
+                    Log.w("SiteSurveys", "retry after refresh: ${r.second}")
+                    SiteRefresh.refresh()
+                    acct = Session.accountFor(token)
+                    r = MoonRepository.siteSurveys(
+                        acct?.siteToken.orEmpty(), acct?.siteSession.orEmpty())
+                }
+                data = r.first
+                err = r.second
+            } else {
+                val r = MoonRepository.surveys(token)
+                data = r.first
+                err = r.second
+            }
+            if (data == null && siteToken.isNotBlank()) {
+                Log.w("SiteSurveys", "fallback to worker: $err")
+                used = "worker"
+                val fb = MoonRepository.surveys(token)
+                data = fb.first
+                err = fb.second
+            }
             if (!isCurrentScope(generation)) return@launchInAccountScope
-            val d = data?.optJSONObject("data") ?: data
-            if (d == null) {
+            // 两种来源：Worker 代理 = {ok, data:{surveys:[…]}}；
+            // 官网直连 = {status:"success", country_code, cpx_enabled, …, data:[…]}。
+            val env = data?.optJSONObject("data") ?: data
+            val items = env?.optJSONArray("surveys") ?: data?.optJSONArray("data")
+            if (env == null) {
                 _surveys.value = SurveysUiState(loading = false,
                     message = err.ifEmpty { "无法获取问卷" })
                 return@launchInAccountScope
             }
-            val country = d.optString("country_code")
-            val quality = d.optInt("quality_score", 0)
+            Log.i("SiteSurveys", "loaded via $used, count=${items?.length() ?: 0}")
 
-            // provider_status: { "cpx": true, ... } —— 为 false 的提供商问卷不显示
-            val statusObj = d.optJSONObject("provider_status")
+            val country = env.optString("country_code")
+            val quality = env.optInt("quality_score", 0)
+
+            // provider_status: { "cpx": true, … } —— 为 false 的提供商问卷不显示；
+            // 官网直连则用扁平开关 cpx_enabled / prime_enabled / theoremreach_enabled …
+            val statusObj = env.optJSONObject("provider_status")
             fun providerEnabled(p: String): Boolean {
-                if (statusObj == null) return true
-                val keys = statusObj.keys()
-                while (keys.hasNext()) {
-                    val k = keys.next()
-                    if (k.equals(p, ignoreCase = true)) return statusObj.optBoolean(k, true)
+                if (p.isBlank()) return true
+                if (statusObj != null) {
+                    val keys = statusObj.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        if (k.equals(p, ignoreCase = true)) return statusObj.optBoolean(k, true)
+                    }
+                    return true   // 未列出的提供商不隐藏
                 }
-                return true   // 未列出的提供商不隐藏
+                return env.optBoolean("${p}_enabled", true)
             }
 
-            val arr = d.optJSONArray("surveys")
+            val arr = items
             val list = mutableListOf<SurveyItem>()
             if (arr != null) {
                 for (i in 0 until arr.length()) {

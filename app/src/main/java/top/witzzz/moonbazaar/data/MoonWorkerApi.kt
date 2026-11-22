@@ -73,6 +73,32 @@ class MoonWorkerApi {
         exec("POST", "/proxy/$path", body, null, token)
 
     /**
+     * 直连站点接口（不经 Worker），用于 moonbazaar.xyz 自己的端点。
+     *
+     * @param url    完整地址，如 `https://moonbazaar.xyz/home/get_surveys.php`
+     * @param cookie 形如 `zlex_token=...; PHPSESSID=...`，为 null/空时不带 Cookie 头
+     */
+    fun siteGet(url: String, cookie: String?): CallResult {
+        return try {
+            val b = Request.Builder()
+                .url(url)
+                .header("Accept", "application/json")
+                .header("X-Requested-With", "XMLHttpRequest")
+            if (!cookie.isNullOrBlank()) b.header("Cookie", cookie)
+            client.newCall(b.get().build()).execute().use { resp ->
+                CallResult(
+                    ok = resp.isSuccessful,
+                    httpStatus = resp.code,
+                    body = resp.body?.string() ?: ""
+                )
+            }
+        } catch (e: Exception) {
+            CallResult(ok = false, httpStatus = -1, body = "",
+                thrown = "网络请求失败：${e.message}")
+        }
+    }
+
+    /**
      * @param token 该请求所属账号的 session token。由调用方在**发起时**快照传入，
      *              避免请求真正执行时账号已被切换、从而把 A 的操作发到 B 名下。
      *              为 null 时退回使用当前全局 session。
