@@ -3,11 +3,13 @@ package top.witzzz.moonbazaar
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.webkit.CookieManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.browser.customtabs.CustomTabsIntent
+import androidx.lifecycle.lifecycleScope
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.displayCutout
@@ -31,6 +33,7 @@ import top.witzzz.moonbazaar.ui.MainViewModel
 import top.witzzz.moonbazaar.ui.MoonApp
 import top.witzzz.moonbazaar.ui.WebLoginScreen
 import top.witzzz.moonbazaar.ui.theme.MyApplicationTheme
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -73,6 +76,12 @@ class MainActivity : ComponentActivity() {
         SiteRefresh.onForeground()
     }
 
+    override fun onPause() {
+        // 把内存里的 Cookie 立刻同步到磁盘，避免进程被杀后丢失登录态。
+        runCatching { CookieManager.getInstance().flush() }
+        super.onPause()
+    }
+
     @Composable
     private fun Root() {
         var showLogin by remember { mutableStateOf(false) }
@@ -101,6 +110,9 @@ class MainActivity : ComponentActivity() {
                             showLogin = false
                             loginRequested = false
                             Session.addAndSelect(token)
+                            // 登录刚完成时站点 Cookie 往往还没下发：立刻用隐藏 WebView 访问一次 /home，
+                            // 把 SSO 登录态换成 zlex_token/PHPSESSID 并写进账号存档。
+                            lifecycleScope.launch { SiteRefresh.refresh(minGapMs = 0L) }
                             // 登录流程里站点可能已经下发官网 Cookie，顺手保存（没有则忽略）
                             SiteCookie.sync()
                             viewModel.refreshAuthState()
@@ -128,6 +140,7 @@ class MainActivity : ComponentActivity() {
         // 消费掉本次登录状态，使同一回调无法被重放
         loginRequested = false
         Session.addAndSelect(token)
+        lifecycleScope.launch { SiteRefresh.refresh(minGapMs = 0L) }
         SiteCookie.sync()
         viewModel.refreshAuthState()
         viewModel.reloadAll()

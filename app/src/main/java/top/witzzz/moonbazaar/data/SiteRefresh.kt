@@ -71,6 +71,7 @@ object SiteRefresh {
 
     fun init(context: Context) {
         appContext = context.applicationContext
+        runCatching { CookieManager.getInstance().setAcceptCookie(true) }
         if (started) return
         started = true
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO).also { s ->
@@ -161,13 +162,17 @@ object SiteRefresh {
                     Log.w(TAG, "webview error: ${error.description}")
                 }
             }
+            // 关键：先把账号存档里的 zlex_token / PHPSESSID 写回 CookieManager，
+            // 否则 CookieManager 为空时 /home 只会返回登录页，既不续期也不下发新 Cookie。
+            val seeded = SiteCookie.seed()
+            Log.i(TAG, "webview refresh seeded=$seeded cookie=${CookieManager.getInstance().getCookie(AppConfig.SITE_URL) != null}")
             web.loadUrl(AppConfig.SITE_HOME_URL)
             delay(WAIT_MS)
             val cm = CookieManager.getInstance()
             cm.flush()
             val synced = SiteCookie.sync()
             Log.i(TAG, "webview refresh synced=$synced token=${SiteCookie.read() != null}")
-            true
+            return@withContext SiteCookie.read() != null
         } catch (e: Exception) {
             Log.w(TAG, "webview refresh failed: ${e.message}")
             false
