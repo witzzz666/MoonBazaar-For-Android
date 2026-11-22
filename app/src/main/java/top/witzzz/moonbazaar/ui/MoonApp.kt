@@ -2,6 +2,7 @@ package top.witzzz.moonbazaar.ui
 
 import android.net.Uri
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,6 +25,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DrawerState
 import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
@@ -50,8 +52,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -434,8 +438,13 @@ private fun SurveysScreen(vm: MainViewModel, modifier: Modifier) {
                 Column(Modifier.weight(1f)) {
                     Text("主要问卷", style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold)
-                    Text(s.message, style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.outline)
+                    Text(
+                        if (s.surveys.isEmpty()) s.message
+                        else "共 ${s.shown.size} 份可做问卷" +
+                            if (s.providerKey == "all") "" else "（已筛选）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
                 }
                 OutlinedButton(onClick = { vm.loadSurveys() },
                     modifier = Modifier.height(34.dp)) { Text("刷新") }
@@ -461,21 +470,99 @@ private fun SurveysScreen(vm: MainViewModel, modifier: Modifier) {
                     }
                 }
             }
-            Spacer(Modifier.height(10.dp))
 
-            if (s.surveys.isEmpty()) {
+            if (s.surveys.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                // 第一优先级：按提供商筛选（显示名用 provider_full）
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    FilterChip(
+                        selected = s.providerKey == "all",
+                        onClick = { vm.setSurveyProvider("all") },
+                        label = { Text("全部 ${s.surveys.size}") }
+                    )
+                    SURVEY_PROVIDERS.forEach { key ->
+                        val count = s.countOf(key)
+                        if (count == 0) return@forEach
+                        val label = s.surveys
+                            .firstOrNull { it.providerKey.equals(key, ignoreCase = true) }
+                            ?.provider?.ifBlank { key } ?: key
+                        FilterChip(
+                            selected = s.providerKey == key,
+                            onClick = { vm.setSurveyProvider(key) },
+                            label = { Text("$label $count") }
+                        )
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                // 第二优先级：在筛选结果内按金额 / 耗时 / 推荐 / 好评从高到低排序
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("排序", style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.outline)
+                    SurveySort.entries.forEach { sort ->
+                        FilterChip(
+                            selected = s.sort == sort,
+                            onClick = { vm.setSurveySort(sort) },
+                            label = { Text(sort.label) }
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+
+            if (s.shown.isEmpty()) {
                 Text(
-                    text = if (s.loading) "加载中…" else s.message.ifEmpty { "暂无可做问卷" },
+                    text = if (s.loading) "加载中…"
+                    else if (s.surveys.isNotEmpty()) "该提供商暂无问卷"
+                    else s.message.ifEmpty { "暂无可做问卷" },
                     modifier = Modifier.padding(horizontal = 16.dp),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.outline
                 )
             } else {
                 LazyColumn(Modifier.fillMaxSize()) {
-                    itemsIndexed(s.surveys) { _, item ->
+                    itemsIndexed(s.shown) { _, item ->
                         SurveyCard(item) { url -> activeSurvey = url }
                     }
                     item { Spacer(Modifier.height(24.dp)) }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 0–5 星评分，**不用 Emoji**：底层的灰色星 + 按比例裁剪的实心星，
+ * 支持 4.5 这种半星（`clipRect` 按宽度比例裁切）。
+ */
+@Composable
+private fun StarRating(rating: Double, modifier: Modifier = Modifier) {
+    val value = rating.coerceIn(0.0, 5.0)
+    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+        for (i in 0 until 5) {
+            val fill = (value - i).coerceIn(0.0, 1.0).toFloat()
+            Box {
+                Text("★", fontSize = 15.sp,
+                    color = MaterialTheme.colorScheme.outlineVariant)
+                if (fill > 0f) {
+                    Text(
+                        "★", fontSize = 15.sp,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.drawWithContent {
+                            clipRect(right = size.width * fill) {
+                                this@drawWithContent.drawContent()
+                            }
+                        }
+                    )
                 }
             }
         }
@@ -499,9 +586,40 @@ private fun SurveyCard(item: SurveyItem, onStart: (String) -> Unit) {
                     Text("${item.reward} GC",
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary)
-                    Text("时长 ${item.loi.ifEmpty { "—" }}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.outline)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("时长", style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline)
+                        Spacer(Modifier.width(4.dp))
+                        Text(item.loi.ifEmpty { "—" },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline)
+                    }
+                }
+            }
+            // 只有 prime / cpx 有推荐数（score）与好评（rating_avg，0–5 星）
+            if (item.showsMeta && (item.hasScore || item.hasRating)) {
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (item.hasScore) {
+                        Text("推荐", style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline)
+                        Spacer(Modifier.width(4.dp))
+                        Text("${item.score}", style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold)
+                    }
+                    if (item.hasRating) {
+                        if (item.hasScore) Spacer(Modifier.width(12.dp))
+                        Text("好评", style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline)
+                        Spacer(Modifier.width(4.dp))
+                        StarRating(item.ratingAvg)
+                        if (item.ratingCount > 0) {
+                            Spacer(Modifier.width(4.dp))
+                            Text("(${item.ratingCount})",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.outline)
+                        }
+                    }
                 }
             }
             if (item.url.isNotBlank()) {

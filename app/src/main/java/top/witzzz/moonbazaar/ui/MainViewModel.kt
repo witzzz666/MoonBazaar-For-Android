@@ -84,8 +84,56 @@ data class SurveyItem(
     val surveyId: String = "",
     val reward: String = "0",   // 单位 GC
     val loi: String = "",       // 问卷时长
-    val url: String = ""
+    val url: String = "",
+    val score: Int = -1,          // 推荐数（0–100，站点给 score；-1 表示没有该数据）
+    val ratingAvg: Double = -1.0, // 好评（0–5 星，站点给 rating_avg；-1 表示没有）
+    val ratingCount: Int = 0,     // 好评数（评分人数，站点给 rating_count）
+    val payoutValue: Double = 0.0,// 排序用的数值金额
+    val loiValue: Int = 0         // 排序用的数值时长
+) {
+    /** 是否有推荐数可展示（目前 prime / cpx 有）。 */
+    val hasScore: Boolean get() = score >= 0
+    /** 是否有好评可展示（评分人数为 0 且分数为 0 时视为没有）。 */
+    val hasRating: Boolean get() = ratingAvg > 0.0 || ratingCount > 0
+    /** 是否展示「推荐 / 好评」这行（站点只在 prime / cpx 上提供）。 */
+    val showsMeta: Boolean get() = providerKey.equals("prime", true) || providerKey.equals("cpx", true)
+}
+
+/** 问卷排序方式（提供商筛选优先，排序只作用于筛选后的列表）。 */
+enum class SurveySort(val label: String) {
+    DEFAULT("默认"),
+    MATCH("推荐"),
+    PAYOUT("金额"),
+    LOI("耗时"),
+    RATING("好评")
+}
+
+/** 可筛选的提供商（按用户给定顺序；显示名用数据里的 provider_full）。 */
+val SURVEY_PROVIDERS: List<String> = listOf(
+    "prime", "zlexq", "cpx", "cherries", "biobrain", "theoremreach", "marketxcel"
 )
+
+/**
+ * 筛选 + 排序：**先按提供商筛选（优先级最高）**，再在结果内排序。
+ *
+ * 金额 / 推荐 / 好评按**从高到低**；耗时按**从低到高**（时长短的排前面，更容易先做）。
+ * 缺失该字段的问卷（如非 prime/cpx 没有 rating_avg）排在最后，不影响其它项。
+ */
+fun filterAndSortSurveys(
+    list: List<SurveyItem>,
+    providerKey: String,
+    sort: SurveySort
+): List<SurveyItem> {
+    val filtered = if (providerKey.isBlank() || providerKey == "all") list
+    else list.filter { it.providerKey.equals(providerKey, ignoreCase = true) }
+    return when (sort) {
+        SurveySort.DEFAULT -> filtered
+        SurveySort.PAYOUT -> filtered.sortedByDescending { it.payoutValue }
+        SurveySort.LOI -> filtered.sortedBy { it.loiValue }
+        SurveySort.MATCH -> filtered.sortedByDescending { it.score }
+        SurveySort.RATING -> filtered.sortedByDescending { it.ratingAvg }
+    }
+}
 
 // 主要问卷页面状态
 data class SurveysUiState(
@@ -93,8 +141,18 @@ data class SurveysUiState(
     val message: String = "",
     val countryCode: String = "",
     val qualityScore: Int = 0,
-    val surveys: List<SurveyItem> = emptyList()
-)
+    val surveys: List<SurveyItem> = emptyList(),
+    val providerKey: String = "all",
+    val sort: SurveySort = SurveySort.DEFAULT
+) {
+    /** 筛选 + 排序后的最终展示列表。 */
+    val shown: List<SurveyItem> get() = filterAndSortSurveys(surveys, providerKey, sort)
+
+    /** 每个提供商有多少份问卷。 */
+    fun countOf(key: String): Int =
+        if (key == "all") surveys.size
+        else surveys.count { it.providerKey.equals(key, ignoreCase = true) }
+}
 
 /**
  * 启动时向 Worker 申请的 MoonBazaar 官方 token（GET /home/mb_token）。
@@ -589,6 +647,31 @@ class MainViewModel : ViewModel() {
     }
 
     // ===== 主要问卷 =====
+    // ===== surveys =====
+
+    /** 切换提供商筛选（"all" 表示全部）。 */
+    fun setSurveyProvider(key: String) {
+        _surveys.value = _surveys.value.copy(providerKey = key)
+    }
+
+    /** 切换排序方式（金额 / 耗时 / 推荐 / 好评，从高到低）。 */
+    fun setSurveySort(sort: SurveySort) {
+        _surveys.value = _surveys.value.copy(sort = sort)
+    }
+
+    /**
+     * 取某账号的官网 Cookie 串：优先用保存的完整 Cookie，
+     * 老账号没有完整串时退回 `zlex_token` + `PHPSESSID`。
+     */
+    private fun siteCookieOf(acct: Account?): String {
+        val raw = acct?.cookies.orEmpty()
+        if (raw.isNotBlank()) return raw
+        val t = acct?.siteToken.orEmpty()
+        if (t.isBlank()) return ""
+        val s = acct?.siteSession.orEmpty()
+        return if (s.isBlank()) "zlex_token=$t" else "zlex_token=$t; PHPSESSID=$s"
+    }
+
     fun loadSurveys() {
         val token = beginAccountRequest() ?: return
         if (_ban.value.banned) {
@@ -598,7 +681,7 @@ class MainViewModel : ViewModel() {
         }
         _surveys.value = _surveys.value.copy(loading = true, message = "")
         launchInAccountScope { generation ->
-            // 只走官网直连 get_surveys.php（zlex_token + PHPSESSID，与网页端同源数据）；
+            // 只走官网直连 get_surveys.php（站点完整 Cookie，与网页端同源数据）；
             // 失败就报错，不回退 Worker 代理。
             val used = "site"
             var data: JSONObject? = null
@@ -606,14 +689,12 @@ class MainViewModel : ViewModel() {
             // 官网凭证每小时轮换：陈旧就先访问 /home 换一份，再请求。
             SiteRefresh.refreshIfStale()
             var acct = Session.accountFor(token)
-            var r = MoonRepository.siteSurveys(
-                acct?.siteToken.orEmpty(), acct?.siteSession.orEmpty())
+            var r = MoonRepository.siteSurveys(siteCookieOf(acct))
             if (r.first == null) {
                 Log.w("SiteSurveys", "retry after refresh: ${r.second}")
                 SiteRefresh.refresh(minGapMs = 0L)
                 acct = Session.accountFor(token)
-                r = MoonRepository.siteSurveys(
-                    acct?.siteToken.orEmpty(), acct?.siteSession.orEmpty())
+                r = MoonRepository.siteSurveys(siteCookieOf(acct))
             }
             data = r.first
             err = r.second
@@ -654,11 +735,20 @@ class MainViewModel : ViewModel() {
                     val j = arr.optJSONObject(i) ?: continue
                     // 过滤用原始 key（provider_status 里的键，如 "cpx"）
                     val providerKey = j.optString("provider")
-                    if (!providerEnabled(providerKey)) continue
-                    // 展示用全名：provider_full（如 "CPX Research"），缺失时回退原始值
+                    if (!providerEnabled(providerKey)) continue                    // 展示用全名：provider_full（如 "CPX Research"），缺失时回退原始值
                     val providerName = j.optString("provider_full").ifBlank { providerKey }
-                    // 真实字段：id / payout / link；同时对示例里的旧键名做兜底
+                    // 真实字段：id / payout / loi / score / match / rating_avg / rating_count / link
                     val payout = if (j.has("payout")) j.opt("payout") else j.opt("reward")
+                    val payoutValue = when (val v = payout) {
+                        is Number -> v.toDouble()
+                        is String -> v.toDoubleOrNull() ?: 0.0
+                        else -> 0.0
+                    }
+                    val loiValue = when (val v = j.opt("loi")) {
+                        is Number -> v.toInt()
+                        is String -> v.toDoubleOrNull()?.toInt() ?: 0
+                        else -> 0
+                    }
                     list.add(
                         SurveyItem(
                             provider = providerName,
@@ -667,17 +757,28 @@ class MainViewModel : ViewModel() {
                             else j.opt("survey_id")?.toString().orEmpty(),
                             reward = numberText(payout).ifEmpty { "0" },
                             loi = numberText(j.opt("loi")),
-                            url = j.optString("link").ifBlank { j.optString("url") }
+                            url = j.optString("link").ifBlank { j.optString("url") },
+                            score = if (j.has("score")) j.optInt("score", -1) else -1,
+                            ratingAvg = if (j.has("rating_avg")) j.optDouble("rating_avg", -1.0) else -1.0,
+                            ratingCount = if (j.has("rating_count")) j.optInt("rating_count", 0) else 0,
+                            payoutValue = payoutValue,
+                            loiValue = loiValue
                         )
                     )
                 }
             }
+            val prev = _surveys.value
             _surveys.value = SurveysUiState(
                 loading = false,
                 message = if (list.isEmpty()) "当前没有可做的问卷" else "共 ${list.size} 份可做问卷",
                 countryCode = country,
                 qualityScore = quality,
-                surveys = list
+                surveys = list,
+                // 刷新后保留用户选择的筛选/排序；提供商已不存在则回退到「全部」
+                providerKey = if (prev.providerKey == "all" ||
+                    list.any { it.providerKey.equals(prev.providerKey, ignoreCase = true) }
+                ) prev.providerKey else "all",
+                sort = prev.sort
             )
         }
     }

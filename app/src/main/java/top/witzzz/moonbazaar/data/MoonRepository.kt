@@ -64,29 +64,40 @@ object MoonRepository {
     /**
      * 直连官网问卷列表 `https://moonbazaar.xyz/home/get_surveys.php`（不经 Worker）。
      *
-     * 鉴权只需要站点 Cookie：`zlex_token`（必须）+ `PHPSESSID`（有就带）。
+     * [cookies] 是该站点在 WebView 里的**完整 Cookie 串**（`a=b; c=d; …`），原样作为 Cookie 头发送：
+     * 除了 `zlex_token` / `PHPSESSID`，站点以后加的其它 Cookie 也会一起带上，不用改代码。
      * 站点返回的是**带转义反斜杠**的 JSON（形如 `{\"ok\":true,...}`），由 [parseSiteJson] 兼容。
      *
      * @return (JSONObject?, 错误信息)。成功时错误信息为空串。
      */
-    fun siteSurveys(siteToken: String, phpSessId: String): Pair<JSONObject?, String> {
-        if (siteToken.isBlank()) return null to "缺少官网登录凭证，请重新登录"
-        val cookie = buildString {
-            append("zlex_token=").append(siteToken)
-            if (phpSessId.isNotBlank()) append("; PHPSESSID=").append(phpSessId)
-        }
-        // 首选：Cookie 头
+    fun siteSurveys(cookies: String): Pair<JSONObject?, String> {
+        val cookie = cookies.trim().trimEnd(';')
+        if (cookie.isBlank()) return null to "缺少官网登录凭证，请重新登录"
+        val siteToken = cookie.split(';')
+            .firstOrNull { it.trim().startsWith("zlex_token=") }
+            ?.substringAfter('=')
+            ?.trim()
+            .orEmpty()
+        val phpSess = cookie.split(';')
+            .firstOrNull { it.trim().startsWith("PHPSESSID=") }
+            ?.substringAfter('=')
+            ?.trim()
+            .orEmpty()
+        // 首选：完整 Cookie 头
         val r1 = api.siteGet(AppConfig.SITE_SURVEYS_URL, cookie)
         val j1 = parseSiteJson(r1.body)
         if (j1 != null && isSurveyPayload(j1)) {
-            Log.i("SiteSurveys", "ok via cookie http=${r1.httpStatus}")
+            Log.i("SiteSurveys", "ok via cookie http=${r1.httpStatus} len=${cookie.length}")
             return j1 to ""
         }
         // 备用：把凭证放进查询参数（部分 PHP 端点不认 Cookie 头）
         val alt = buildString {
             append(AppConfig.SITE_SURVEYS_URL)
-            append("?token=").append(urlEnc(siteToken))
-            if (phpSessId.isNotBlank()) append("&PHPSESSID=").append(urlEnc(phpSessId))
+            if (siteToken.isNotBlank()) append("?token=").append(urlEnc(siteToken))
+            if (phpSess.isNotBlank()) {
+                append(if (siteToken.isNotBlank()) "&PHPSESSID=" else "?PHPSESSID=")
+                append(urlEnc(phpSess))
+            }
         }
         val r2 = api.siteGet(alt, cookie)
         val j2 = parseSiteJson(r2.body)

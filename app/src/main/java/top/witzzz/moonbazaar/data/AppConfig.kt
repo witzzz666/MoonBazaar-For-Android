@@ -49,13 +49,15 @@ object AppConfig {
  *
  * 同一个账号会同时保存三套凭证，彼此独立、互不覆盖：
  * - [token]：Worker 的 X-Client-Session（调 API 用）；
- * - [siteToken] / [siteSession]：官网 moonbazaar.xyz 的 `zlex_token` 与 `PHPSESSID` Cookie（直连官网问卷接口用）；
+ * - [cookies]：官网 moonbazaar.xyz 的**完整 Cookie 串**（`a=b; c=d; …`，直连官网问卷接口时原样带上）；
+ * - [siteToken] / [siteSession]：从 [cookies] 里挑出来的 `zlex_token` 与 `PHPSESSID`（兼容与展示用）；
  * - [mbAccessToken] / [mbRefreshToken] / [mbExpiresAt]：`GET /home/mb_token` 申请的 OAuth token（expiresAt 为服务器给的秒级时间戳）。
  */
 data class Account(
     val uid: String = "",
     val username: String = "",
     val token: String = "",
+    val cookies: String = "",
     val siteToken: String = "",
     val siteSession: String = "",
     val mbAccessToken: String = "",
@@ -75,6 +77,7 @@ data class Account(
 
     val hasSiteToken: Boolean get() = siteToken.isNotBlank()
     val hasSiteSession: Boolean get() = siteSession.isNotBlank()
+    val hasCookies: Boolean get() = cookies.isNotBlank()
     val hasMbToken: Boolean get() = mbAccessToken.isNotBlank()
 }
 
@@ -309,6 +312,10 @@ object Session {
     val currentSiteSession: String?
         get() = currentAccount?.siteSession?.takeIf { it.isNotBlank() }
 
+    /** 当前账号的官网完整 Cookie 串（没有则 null）。 */
+    val currentCookies: String?
+        get() = currentAccount?.cookies?.takeIf { it.isNotBlank() }
+
     /** 按 session token 取账号（请求发起时的快照，避免中途切换账号读错人）。 */
     fun accountFor(sessionToken: String?): Account? {
         val t = sessionToken ?: return currentAccount
@@ -316,23 +323,27 @@ object Session {
     }
 
     /**
-     * 保存某个账号在官网 moonbazaar.xyz 拿到的 `zlex_token` 和 `PHPSESSID`。
+     * 保存某个账号在官网 moonbazaar.xyz 拿到的**完整 Cookie 串**。
      *
      * 与 Worker session token 并存保存，不互相覆盖——两者是不同体系的凭证。
+     * `zlex_token` / `PHPSESSID` 会从 [cookies] 里自动挑出来单独保存，方便展示与旧逻辑。
      * [sessionToken] 为空时表示当前账号；传入发起请求时的 token 可避免切换账号后写错人。
      */
     fun updateSiteCredentials(
         siteToken: String,
         siteSession: String = "",
-        sessionToken: String? = null
+        sessionToken: String? = null,
+        cookies: String = ""
     ) {
         val v = siteToken.trim()
         if (v.isBlank()) return
         val s = siteSession.trim()
+        val c = cookies.trim()
         updateAccount(sessionToken) {
             it.copy(
                 siteToken = v,
-                siteSession = s.ifBlank { it.siteSession }
+                siteSession = s.ifBlank { it.siteSession },
+                cookies = c.ifBlank { it.cookies }
             )
         }
     }
@@ -374,7 +385,8 @@ object Session {
         // 只记录「存了哪一类凭证」，不打印 token 本体
         Log.i(
             "Account",
-            "saved ${updated.key} site=${updated.siteToken != untouched.siteToken} " +
+            "saved ${updated.key} cookies=${updated.cookies != untouched.cookies} " +
+                "site=${updated.siteToken != untouched.siteToken} " +
                 "sess=${updated.siteSession != untouched.siteSession} " +
                 "mb=${updated.mbAccessToken != untouched.mbAccessToken}"
         )
@@ -402,6 +414,7 @@ object Session {
                     uid = o.optString("uid"),
                     username = o.optString("username"),
                     token = token,
+                    cookies = o.optString("cookies"),
                     siteToken = o.optString("site_token"),
                     siteSession = o.optString("site_session"),
                     mbAccessToken = o.optString("mb_access_token"),
@@ -423,6 +436,7 @@ object Session {
                     put("uid", a.uid)
                     put("username", a.username)
                     put("token", a.token)
+                    put("cookies", a.cookies)
                     put("site_token", a.siteToken)
                     put("site_session", a.siteSession)
                     put("mb_access_token", a.mbAccessToken)
