@@ -3,6 +3,7 @@ package top.witzzz.moonbazaar.ui
 import android.annotation.SuppressLint
 import android.graphics.Bitmap
 import android.net.Uri
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -325,6 +326,10 @@ fun SurveyWebScreen(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
                     )
+                    // 首帧先不显示：WebView 刚创建时会闪一下白屏，把上面的标题栏盖住。
+                    // 等页面真正画出内容（onPageCommitVisible / onPageFinished）再显示。
+                    visibility = View.INVISIBLE
+                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
                     settings.useWideViewPort = true
@@ -388,9 +393,15 @@ fun SurveyWebScreen(
                             if (url != null) shownUrl = url
                         }
 
+                        // 页面已经画出第一帧内容：此时再显示 WebView，避免白屏闪烁。
+                        override fun onPageCommitVisible(view: WebView?, url: String?) {
+                            if (view != null) view.visibility = View.VISIBLE
+                        }
+
                         override fun onPageFinished(view: WebView?, url: String?) {
                             loading = false
                             if (url != null) shownUrl = url
+                            view?.visibility = View.VISIBLE
                         }
                     }
 

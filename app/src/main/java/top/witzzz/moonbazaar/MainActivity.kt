@@ -92,16 +92,8 @@ class MainActivity : ComponentActivity() {
                     .fillMaxSize()
                     .windowInsetsPadding(WindowInsets.displayCutout)
             ) {
-                MoonApp(
-                    vm = viewModel,
-                    openUrl = ::openExternal,
-                    onStartLogin = {
-                        // 标记登录已发起，登录回调才会被接受
-                        loginRequested = true
-                        showLogin = true
-                    }
-                )
-
+                // 登录页不要叠加在主界面之上：叠加时原生 WebView 首帧会铺满整个窗口，
+                // 把顶栏盖住，直到页面加载完成才恢复。改成互斥渲染后，顶栏第一帧就在。
                 if (showLogin) {
                     WebLoginScreen(
                         startUrl = AppConfig.BASE_URL.trimEnd('/') + "/auth/login",
@@ -121,6 +113,16 @@ class MainActivity : ComponentActivity() {
                         onClose = {
                             showLogin = false
                             loginRequested = false
+                        }
+                    )
+                } else {
+                    MoonApp(
+                        vm = viewModel,
+                        openUrl = ::openExternal,
+                        onStartLogin = {
+                            // 标记登录已发起，登录回调才会被接受
+                            loginRequested = true
+                            showLogin = true
                         }
                     )
                 }
