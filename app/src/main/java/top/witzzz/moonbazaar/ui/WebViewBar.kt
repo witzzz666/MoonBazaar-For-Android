@@ -1,4 +1,4 @@
-package top.witzzz.moonbazaar.ui
+﻿package top.witzzz.moonbazaar.ui
 
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -14,6 +14,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
@@ -26,9 +27,10 @@ internal fun WebViewTopBar(
     loading: Boolean,
     onRefresh: () -> Unit,
     onClose: () -> Unit,
-    closeText: String = "← 返回"
+    closeText: String = "← 返回",
+    background: Color = Color.Unspecified
 ) {
-    Surface(tonalElevation = 3.dp) {
+    Surface(tonalElevation = 3.dp, color = if (background == Color.Unspecified) MaterialTheme.colorScheme.surface else background) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically
